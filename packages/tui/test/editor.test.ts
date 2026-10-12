@@ -2695,6 +2695,117 @@ describe("Editor component", () => {
 			assert.strictEqual(aborts, 1);
 		});
 
+		// A provider whose answers the test releases by hand, so a keystroke can land while a request is still open.
+		function createHeldProvider(): {
+			provider: AutocompleteProvider;
+			requests: Array<{ text: string; resolve: (items: string[] | null) => void }>;
+		} {
+			const requests: Array<{ text: string; resolve: (items: string[] | null) => void }> = [];
+			const provider: AutocompleteProvider = {
+				getSuggestions: (lines, cursorLine, cursorCol, options) => {
+					const text = lines[cursorLine]!.slice(0, cursorCol);
+					return new Promise((resolve) => {
+						const request = {
+							text,
+							resolve: (items: string[] | null) =>
+								resolve(
+									items ? { items: items.map((value) => ({ value, label: value })), prefix: text } : null,
+								),
+						};
+						options.signal.addEventListener("abort", () => resolve(null), { once: true });
+						requests.push(request);
+					});
+				},
+				applyCompletion,
+			};
+			return { provider, requests };
+		}
+
+		async function typeAndAnswer(
+			editor: Editor,
+			held: ReturnType<typeof createHeldProvider>,
+			text: string,
+			items: string[] | null,
+		): Promise<void> {
+			for (const char of text) editor.handleInput(char);
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			held.requests.at(-1)!.resolve(items);
+			await flushAutocomplete();
+		}
+
+		it("applies Enter to the refreshed list when pressed while the refresh is pending", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const held = createHeldProvider();
+			const submitted: string[] = [];
+			editor.onSubmit = (text) => submitted.push(text);
+			editor.setAutocompleteProvider(held.provider);
+
+			await typeAndAnswer(editor, held, "@~/D", ["@~/Desktop/", "@~/Documents/", "@~/Downloads/"]);
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+
+			for (const char of "own") editor.handleInput(char);
+			editor.handleInput("\r");
+			assert.strictEqual(editor.getText(), "@~/Down");
+			assert.deepStrictEqual(submitted, []);
+
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			assert.strictEqual(held.requests.at(-1)!.text, "@~/Down");
+			held.requests.at(-1)!.resolve(["@~/Downloads/"]);
+			await flushAutocomplete();
+
+			assert.strictEqual(editor.getText(), "@~/Downloads/");
+			assert.strictEqual(editor.isShowingAutocomplete(), false);
+			assert.deepStrictEqual(submitted, []);
+		});
+
+		it("applies Tab to the refreshed list when pressed while the refresh is pending", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const held = createHeldProvider();
+			editor.setAutocompleteProvider(held.provider);
+
+			await typeAndAnswer(editor, held, "@~/D", ["@~/Desktop/", "@~/Downloads/"]);
+			for (const char of "own") editor.handleInput(char);
+			editor.handleInput("\t");
+			assert.strictEqual(editor.getText(), "@~/Down");
+
+			await typeAndAnswer(editor, held, "", ["@~/Downloads/"]);
+			assert.strictEqual(editor.getText(), "@~/Downloads/");
+		});
+
+		it("drops a deferred Enter when typing continues before the refresh answers", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const held = createHeldProvider();
+			const submitted: string[] = [];
+			editor.onSubmit = (text) => submitted.push(text);
+			editor.setAutocompleteProvider(held.provider);
+
+			await typeAndAnswer(editor, held, "@~/D", ["@~/Desktop/", "@~/Downloads/"]);
+			for (const char of "ow") editor.handleInput(char);
+			editor.handleInput("\r");
+			await typeAndAnswer(editor, held, "n", ["@~/Downloads/"]);
+
+			assert.strictEqual(editor.getText(), "@~/Down");
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+			assert.deepStrictEqual(submitted, []);
+		});
+
+		it("drops a deferred Enter when the refresh finds nothing", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const held = createHeldProvider();
+			const submitted: string[] = [];
+			editor.onSubmit = (text) => submitted.push(text);
+			editor.setAutocompleteProvider(held.provider);
+
+			await typeAndAnswer(editor, held, "@~/D", ["@~/Desktop/", "@~/Downloads/"]);
+			for (const char of "ox") editor.handleInput(char);
+			editor.handleInput("\r");
+			await typeAndAnswer(editor, held, "", null);
+
+			assert.strictEqual(editor.getText(), "@~/Dox");
+			assert.strictEqual(editor.isShowingAutocomplete(), false);
+			assert.deepStrictEqual(submitted, []);
+		});
+
 		it("hides autocomplete when backspacing slash command to empty", async () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
 

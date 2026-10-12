@@ -1,4 +1,4 @@
-import type { AutocompleteProvider, AutocompleteSuggestions } from "../autocomplete.ts";
+import type { AutocompleteItem, AutocompleteProvider, AutocompleteSuggestions } from "../autocomplete.ts";
 import { getKeybindings } from "../keybindings.ts";
 import { decodePrintableKey, matchesKey } from "../keys.ts";
 import { KillRing } from "../kill-ring.ts";
@@ -333,6 +333,10 @@ export class Editor implements Component, Focusable {
 	private autocompleteRequestTask: Promise<void> = Promise.resolve();
 	private autocompleteStartToken: number = 0;
 	private autocompleteRequestId: number = 0;
+	// True while the list on screen was computed for an earlier text and the request for the current text has not answered yet.
+	private autocompleteRefreshPending: boolean = false;
+	// Tab or Enter pressed while a refresh was pending; applied to the fresh list when it arrives.
+	private autocompleteDeferredAccept: "tab" | "confirm" | null = null;
 
 	// Paste tracking for large pastes
 	private pastes: Map<number, string> = new Map();
@@ -767,51 +771,24 @@ export class Editor implements Component, Focusable {
 			}
 
 			if (kb.matches(data, "tui.input.tab")) {
-				const selected = this.autocompleteList.getSelectedItem();
-				if (selected && this.autocompleteProvider) {
-					this.pushUndoSnapshot();
-					this.lastAction = null;
-					const result = this.autocompleteProvider.applyCompletion(
-						this.state.lines,
-						this.state.cursorLine,
-						this.state.cursorCol,
-						selected,
-						this.autocompletePrefix,
-					);
-					this.state.lines = result.lines;
-					this.state.cursorLine = result.cursorLine;
-					this.setCursorCol(result.cursorCol);
-					this.cancelAutocomplete();
-					if (this.onChange) this.onChange(this.getText());
+				if (this.autocompleteRefreshPending) {
+					// The list on screen belongs to an earlier text; accept from the fresh list once it arrives.
+					this.autocompleteDeferredAccept = "tab";
+					return;
 				}
+				this.acceptAutocompleteSelection("tab");
 				return;
 			}
 
 			if (kb.matches(data, "tui.select.confirm")) {
-				const selected = this.autocompleteList.getSelectedItem();
-				if (selected && this.autocompleteProvider) {
-					this.pushUndoSnapshot();
-					this.lastAction = null;
-					const result = this.autocompleteProvider.applyCompletion(
-						this.state.lines,
-						this.state.cursorLine,
-						this.state.cursorCol,
-						selected,
-						this.autocompletePrefix,
-					);
-					this.state.lines = result.lines;
-					this.state.cursorLine = result.cursorLine;
-					this.setCursorCol(result.cursorCol);
-
-					if (this.autocompletePrefix.startsWith("/")) {
-						this.cancelAutocomplete();
-						// Fall through to submit
-					} else {
-						this.cancelAutocomplete();
-						if (this.onChange) this.onChange(this.getText());
-						return;
-					}
+				if (this.autocompleteRefreshPending) {
+					this.autocompleteDeferredAccept = "confirm";
+					return;
 				}
+				if (this.acceptAutocompleteSelection("confirm") === "applied") {
+					return;
+				}
+				// A completed slash command name, or an empty list, falls through to submit
 			}
 		}
 
@@ -2240,23 +2217,39 @@ export class Editor implements Component, Focusable {
 		const layout = prefix.startsWith("/") ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
 		const list = new SelectList(items, this.autocompleteMaxVisible, this.theme.selectList, layout);
 		list.onSelect = (selected) => {
-			if (!this.autocompleteProvider) return;
-			this.pushUndoSnapshot();
-			this.lastAction = null;
-			const result = this.autocompleteProvider.applyCompletion(
-				this.state.lines,
-				this.state.cursorLine,
-				this.state.cursorCol,
-				selected,
-				this.autocompletePrefix,
-			);
-			this.state.lines = result.lines;
-			this.state.cursorLine = result.cursorLine;
-			this.setCursorCol(result.cursorCol);
+			this.applyAutocompleteItem(selected, this.autocompletePrefix);
 			this.cancelAutocomplete();
 			this.onChange?.(this.getText());
 		};
 		return list;
+	}
+
+	private applyAutocompleteItem(item: AutocompleteItem, prefix: string): void {
+		if (!this.autocompleteProvider) return;
+		this.pushUndoSnapshot();
+		this.lastAction = null;
+		const result = this.autocompleteProvider.applyCompletion(
+			this.state.lines,
+			this.state.cursorLine,
+			this.state.cursorCol,
+			item,
+			prefix,
+		);
+		this.state.lines = result.lines;
+		this.state.cursorLine = result.cursorLine;
+		this.setCursorCol(result.cursorCol);
+	}
+
+	// Applies the highlighted list item for Tab or Enter. "command" means Enter completed a slash command name, which the caller submits.
+	private acceptAutocompleteSelection(mode: "tab" | "confirm"): "applied" | "command" | "none" {
+		const selected = this.autocompleteList?.getSelectedItem();
+		if (!selected || !this.autocompleteProvider) return "none";
+		const prefix = this.autocompletePrefix;
+		this.applyAutocompleteItem(selected, prefix);
+		this.cancelAutocomplete();
+		if (mode === "confirm" && prefix.startsWith("/")) return "command";
+		if (this.onChange) this.onChange(this.getText());
+		return "applied";
 	}
 
 	private tryTriggerAutocomplete(explicitTab: boolean = false): void {
@@ -2301,6 +2294,7 @@ export class Editor implements Component, Focusable {
 		}
 
 		this.cancelAutocompleteRequest();
+		this.autocompleteRefreshPending = this.autocompleteState !== null;
 		const startToken = ++this.autocompleteStartToken;
 
 		const debounceMs = this.getAutocompleteDebounceMs(options);
@@ -2391,25 +2385,18 @@ export class Editor implements Component, Focusable {
 		}
 
 		if (options.force && options.explicitTab && suggestions.items.length === 1) {
-			const item = suggestions.items[0]!;
-			this.pushUndoSnapshot();
-			this.lastAction = null;
-			const result = this.autocompleteProvider.applyCompletion(
-				this.state.lines,
-				this.state.cursorLine,
-				this.state.cursorCol,
-				item,
-				suggestions.prefix,
-			);
-			this.state.lines = result.lines;
-			this.state.cursorLine = result.cursorLine;
-			this.setCursorCol(result.cursorCol);
+			this.applyAutocompleteItem(suggestions.items[0]!, suggestions.prefix);
 			if (this.onChange) this.onChange(this.getText());
 			this.tui.requestRender();
 			return;
 		}
 
 		this.applyAutocompleteSuggestions(suggestions, options.force ? "force" : "regular");
+		const deferredAccept = this.autocompleteDeferredAccept;
+		this.autocompleteDeferredAccept = null;
+		if (deferredAccept && this.acceptAutocompleteSelection(deferredAccept) === "command" && !this.disableSubmit) {
+			this.submitValue();
+		}
 		this.tui.requestRender();
 	}
 
@@ -2439,10 +2426,12 @@ export class Editor implements Component, Focusable {
 		}
 
 		this.autocompleteState = state;
+		this.autocompleteRefreshPending = false;
 	}
 
 	private cancelAutocompleteRequest(): void {
 		this.autocompleteStartToken += 1;
+		this.autocompleteDeferredAccept = null;
 		if (this.autocompleteDebounceTimer) {
 			clearTimeout(this.autocompleteDebounceTimer);
 			this.autocompleteDebounceTimer = undefined;
@@ -2455,6 +2444,7 @@ export class Editor implements Component, Focusable {
 		this.autocompleteState = null;
 		this.autocompleteList = undefined;
 		this.autocompletePrefix = "";
+		this.autocompleteRefreshPending = false;
 	}
 
 	private cancelAutocomplete(): void {
